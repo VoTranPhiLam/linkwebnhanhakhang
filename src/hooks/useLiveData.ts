@@ -65,15 +65,35 @@ export interface LiveData {
 }
 
 async function fetchLive(): Promise<{live:ArbItem[], ts:number}> {
-  const r = await api.get('/receiver?mode=live')
-  const live: ArbItem[] = r.data?.live?.data || []
-  live.sort((a,b)=> (b.last_update_ts||b.ts||0) - (a.last_update_ts||a.ts||0))
-  const norm = live.map(t => ({
-    ...t,
-    active: !!(t.trigger1 || t.trigger2),            // NEW
-    _id: t._id || `${t.version||0}-${t.server||''}-${t.client||''}-${t.symbol||''}`
-  }))
-  return { live: norm, ts: r.data?.ts || Date.now()/1000 }
+  const LIVE_MAX_AGE_SEC = Number((import.meta as any).env?.VITE_LIVE_MAX_AGE_SEC || "10");
+  const nowSec = Date.now() / 1000;
+
+  try {
+    const res = await api.get("/receiver", { params: { mode: "live" } });
+    const rawItems: ArbItem[] = Array.isArray(res.data?.live?.data)
+      ? res.data.live.data
+      : [];
+
+    const live = LIVE_MAX_AGE_SEC > 0
+      ? rawItems.filter((item) => {
+          const lastRaw =
+            item.last_update_ts ?? item.ts ?? item.start_ts ?? 0;
+          let lastSec = typeof lastRaw === "number"
+            ? lastRaw
+            : Number(lastRaw) || 0;
+          if (lastSec > 1e11) lastSec /= 1000; // phòng ms
+          if (lastSec <= 0) return false;
+          return nowSec - lastSec <= LIVE_MAX_AGE_SEC;
+        })
+      : rawItems;
+
+    return {
+      live,
+      ts: Number(res.data?.ts) || Date.now(),
+    };
+  } catch {
+    return { live: [], ts: Date.now() };
+  }
 }
 
 async function fetchOld(): Promise<{old:ArbItem[], ts:number}> {

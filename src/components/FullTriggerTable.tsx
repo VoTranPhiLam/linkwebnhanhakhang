@@ -96,6 +96,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   const audioAlertRef = useRef<HTMLAudioElement | null>(null);
   const soundUnlockedRef = useRef(false);
   const pendingPlayRef = useRef(false);
+  const [stableVersion, setStableVersion] = useState(0);
 
   // Unique ID generator cho signal (tránh phụ thuộc format tự ráp dễ lệch với exec)
   const genSignalId = useRef<{ next: () => string }>({
@@ -124,6 +125,15 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     }
   });
   const [hideModalOpen, setHideModalOpen] = useState(false);
+
+  useEffect(() => {
+    if (!rows.length) {
+      stableRef.current = {};
+      prevKeysRef.current = new Set();
+      orderRef.current = 0;
+      setStableVersion((v) => v + 1);
+    }
+  }, [rows.length]);
 
   useEffect(() => {
     localStorage.setItem("hiddenMapV1", JSON.stringify(hiddenMap));
@@ -175,7 +185,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   const [combinedSearch, setCombinedSearch] = useState("");
   const [volServer, setVolServer] = useState<Record<string, string>>({});
   const [volClient, setVolClient] = useState<Record<string, string>>({});
-  const [oldMaxAgeSec, setOldMaxAgeSec] = useState<number>(isOld ? 600 : 0);
+  const [oldMaxAgeSec, setOldMaxAgeSec] = useState<number>(isOld ? 180 : 0);
   const [timeTick, setTimeTick] = useState(() => Date.now() / 1000);
   const [expandedBrokers, setExpandedBrokers] = useState<Set<string>>(
     new Set()
@@ -448,7 +458,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
       Object.values(stableRef.current)
         .sort((a, b) => a.firstOrder - b.firstOrder)
         .map((s) => s.row),
-    [rows]
+    [rows, stableVersion]
   );
 
   const servers = useMemo(() => {
@@ -469,10 +479,11 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     return displayRows.filter((r) => {
       const k = keyOf(r);
       if (deletedKeys.has(k)) return false;
-      if (!isOld && isHiddenActive(k)) return false; // NEW: loại bỏ hàng đang ẩn ở live
+      if (!isOld && isHiddenActive(k)) return false;
       if (serverFilter !== "ALL" && r.server !== serverFilter) return false;
       if (categoryFilter !== "ALL" && r.category !== categoryFilter)
         return false;
+
       if (q) {
         const match =
           (r.symbol || "").toLowerCase().includes(q) ||
@@ -480,10 +491,12 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
           (r.client || "").toLowerCase().includes(q);
         if (!match) return false;
       }
+
       if (isOld) {
         const endTs = r.ended_ts || r.last_update_ts || r.ts || 0;
-        if (endTs > 0 && oldMaxAgeSec > 0 && now - endTs > oldMaxAgeSec)
+        if (endTs > 0 && oldMaxAgeSec > 0 && now - endTs > oldMaxAgeSec) {
           return false;
+        }
       }
       return true;
     });
@@ -578,6 +591,8 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   useEffect(() => {
     const t = nowSec();
     const currentKeys = new Set<string>();
+    let changed = false;
+
     rows.forEach((r) => {
       const k = keyOf(r);
       currentKeys.add(k);
@@ -590,17 +605,30 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
             firstOrder: orderRef.current++,
             lastSeen: t,
           };
+          changed = true;
         } else {
-          slot.row = r;
+          if (slot.row !== r) {
+            slot.row = r;
+            changed = true;
+          } else {
+            slot.row = r;
+          }
           slot.lastSeen = t;
         }
       } else if (stableRef.current[k]) {
         delete stableRef.current[k];
+        changed = true;
       }
     });
+
     Object.keys(stableRef.current).forEach((k) => {
-      if (!currentKeys.has(k)) delete stableRef.current[k];
+      if (!currentKeys.has(k)) {
+        delete stableRef.current[k];
+        changed = true;
+      }
     });
+
+    if (changed) setStableVersion((v) => v + 1);
   }, [rows]);
 
   // Fetch pending orders (global)
