@@ -56,6 +56,9 @@ export interface ArbItem {
   category?: string
   reason?: string
   active?: boolean 
+  local_time?: string
+  min_volume_server?: number
+  min_volume_client?: number
 }
 
 export interface LiveData {
@@ -115,10 +118,16 @@ export function useLiveData() {
     queryKey: ['arb_live_only'],
     queryFn: fetchLive,
     refetchInterval: refetchMs > 0 ? refetchMs : false,
+    refetchIntervalInBackground: true,
     staleTime: refetchMs > 0 ? refetchMs : Infinity,
-    gcTime: 5*60*1000,
-    structuralSharing: true
+    gcTime: 5 * 60 * 1000,
+    structuralSharing: true,
+    networkMode: 'always',
   })
+
+  React.useEffect(() => {
+    liveQ.refetch()
+  }, [refetchMs, liveQ])
 
   // Old triggers: refetch cố định 10s (có thể chỉnh), không phụ thuộc control
   const oldQ = useQuery({

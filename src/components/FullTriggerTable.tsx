@@ -1,15 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ArbItem } from "../hooks/useLiveData";
 import { usePositions, getBrokerPositions } from "../hooks/usePositions";
-import { Bell, BellOff, Calendar } from "lucide-react";
+import { Bell, BellOff, Calendar, ArrowUp } from "lucide-react";
 import React from "react";
-import api from "../api/api";
+import api, { getSheetsConfig, pushKeoRow } from "../api/api";
 
 interface Props {
   rows: ArbItem[];
   disableSound?: boolean;
   isOld?: boolean;
+  soundUrl?: string;
 }
 
 interface Toast {
@@ -72,14 +73,18 @@ const MERGE_TOASTS = true;
 const SOUND_ALERT = "/sounds/lechgia.mp3";
 const SOUND_VOLUME = Number((import.meta as any).env?.VITE_SOUND_VOLUME || "1");
 
-export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
+export default function FullTriggerTable({
+  rows,
+  disableSound,
+  isOld,
+  soundUrl,
+}: Props) {
   // ===== Core refs / states =====
   const positionsData = usePositions(1000);
   const stableRef = useRef<
     Record<string, { row: ArbItem; firstOrder: number; lastSeen: number }>
   >({});
   const orderRef = useRef(0);
-  const prevKeysRef = useRef<Set<string>>(new Set());
   const inFlightKeyRef = useRef<Set<string>>(new Set());
   const pendingRef = useRef<Record<string, boolean>>({});
   const pendingTimeRef = useRef<Record<string, number>>({});
@@ -94,9 +99,10 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     >
   >({});
   const audioAlertRef = useRef<HTMLAudioElement | null>(null);
-  const soundUnlockedRef = useRef(false);
-  const pendingPlayRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const [stableVersion, setStableVersion] = useState(0);
+  const prevActiveKeysRef = useRef<Set<string>>(new Set());
+  const alertSrc = soundUrl || SOUND_ALERT;
 
   // Unique ID generator cho signal (tránh phụ thuộc format tự ráp dễ lệch với exec)
   const genSignalId = useRef<{ next: () => string }>({
@@ -125,15 +131,6 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     }
   });
   const [hideModalOpen, setHideModalOpen] = useState(false);
-
-  useEffect(() => {
-    if (!rows.length) {
-      stableRef.current = {};
-      prevKeysRef.current = new Set();
-      orderRef.current = 0;
-      setStableVersion((v) => v + 1);
-    }
-  }, [rows.length]);
 
   useEffect(() => {
     localStorage.setItem("hiddenMapV1", JSON.stringify(hiddenMap));
@@ -185,7 +182,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   const [combinedSearch, setCombinedSearch] = useState("");
   const [volServer, setVolServer] = useState<Record<string, string>>({});
   const [volClient, setVolClient] = useState<Record<string, string>>({});
-  const [oldMaxAgeSec, setOldMaxAgeSec] = useState<number>(isOld ? 180 : 0);
+  const [oldMaxAgeSec, setOldMaxAgeSec] = useState<number>(isOld ? 14400 : 0);
   const [timeTick, setTimeTick] = useState(() => Date.now() / 1000);
   const [expandedBrokers, setExpandedBrokers] = useState<Set<string>>(
     new Set()
@@ -204,6 +201,31 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   const [quietPanelOpen, setQuietPanelOpen] = useState(false);
   const quietBtnRef = useRef<HTMLButtonElement | null>(null);
   const [quietBtnRect, setQuietBtnRect] = useState<DOMRect | null>(null);
+
+  // --- NEW: Global mute theo phút ---
+  const [globalMuteUntil, setGlobalMuteUntil] = useState<number | null>(() => {
+    try {
+      const v = Number(localStorage.getItem("globalMuteUntil") || "");
+      return v > Date.now() ? v : null;
+    } catch {
+      return null;
+    }
+  });
+  useEffect(() => {
+    if (globalMuteUntil && globalMuteUntil > Date.now()) {
+      localStorage.setItem("globalMuteUntil", String(globalMuteUntil));
+    } else {
+      localStorage.removeItem("globalMuteUntil");
+    }
+  }, [globalMuteUntil]);
+
+  const isGlobalMuted = () =>
+    !isOld && globalMuteUntil != null && Date.now() < globalMuteUntil;
+
+  const [gmOpen, setGmOpen] = useState(false);
+  const gmBtnRef = useRef<HTMLButtonElement | null>(null);
+  const [gmBtnRect, setGmBtnRect] = useState<DOMRect | null>(null);
+  const [gmMins, setGmMins] = useState<number>(30);
 
   // rowMute: { muted: boolean; until: timestamp|null }
   const [rowMute, setRowMute] = useState<
@@ -286,6 +308,13 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   const nowSec = () => Date.now() / 1000;
   const keyOf = (r: ArbItem) =>
     `${r.server || ""}|${r.client || ""}|${r.symbol || ""}`;
+  // Helper format 24h YYYY-MM-DD HH:mm:ss
+  const fmtYmdHms = (d: Date) => {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+      d.getDate()
+    )} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
 
   // ===== Toast helpers =====
   const upsertToast = (
@@ -315,43 +344,115 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
       ? "Hủy lệnh chờ"
       : "Mở lệnh";
 
-  const playBeep = (freq = 880, durMs = 120) => {
+  const playBeep = useCallback((freq = 880, durMs = 120) => {
     try {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new Ctx();
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      osc.connect(g);
-      g.connect(ctx.destination);
-      g.gain.value = 0.35;
-      osc.start();
-      setTimeout(() => {
-        osc.stop();
-        ctx.close();
-      }, durMs);
+      if (!Ctx) return;
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new Ctx();
+      }
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const start = () => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        osc.connect(g);
+        g.connect(ctx.destination);
+        g.gain.value = 0.35;
+        osc.start();
+        setTimeout(() => {
+          try {
+            g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.1);
+            osc.stop(ctx.currentTime + 0.1);
+            osc.disconnect();
+            g.disconnect();
+          } catch {}
+        }, durMs);
+      };
+      if (ctx.state !== "running") {
+        ctx
+          .resume()
+          .then(() => {
+            if (ctx.state === "running") start();
+          })
+          .catch(() => {});
+        return;
+      }
+      start();
     } catch {}
-  };
+  }, []);
 
-  const playSound = () => {
-    if (isOld) return;
-    if (isWithinQuiet()) return;
-    if (disableSound) return;
-    if (!soundUnlockedRef.current) {
-      pendingPlayRef.current = true;
+  const playSound = useCallback(() => {
+    if (isOld || disableSound || isWithinQuiet() || isGlobalMuted()) return;
+    const audio = audioAlertRef.current;
+    if (audio) {
+      audio.currentTime = 0;
+      audio.play().catch(() => {
+        playBeep(660);
+      });
       return;
     }
-    const a = audioAlertRef.current;
-    if (a) {
-      try {
-        a.currentTime = 0;
-        a.play().catch(() => playBeep(660));
-      } catch {
-        playBeep(660);
+    playBeep(660);
+  }, [disableSound, isOld, isWithinQuiet, isGlobalMuted, playBeep]);
+
+  // Phát âm thanh khi có kèo mới kích hoạt, bỏ qua các kèo đang ẩn
+  useEffect(() => {
+    const activeKeys = new Set(
+      rows
+        .filter((r) => {
+          const k = keyOf(r);
+          return (r.trigger1 || r.trigger2) && !isHiddenActive(k);
+        })
+        .map((r) => keyOf(r))
+    );
+
+    let shouldPlay = false;
+    activeKeys.forEach((k) => {
+      if (!prevActiveKeysRef.current.has(k) && !isRowMuted(k)) {
+        shouldPlay = true;
       }
-    } else playBeep(660);
-  };
+    });
+    prevActiveKeysRef.current = activeKeys;
+    if (shouldPlay) playSound();
+  }, [rows, playSound, isRowMuted, hiddenMap, hideTtlMins, isOld]); // thêm deps để xét ẩn kèo
+
+  useEffect(() => {
+    const audio = new Audio(alertSrc);
+    audio.preload = "auto";
+    audio.volume = Math.min(1, Math.max(0, SOUND_VOLUME));
+    audioAlertRef.current = audio;
+    return () => {
+      audio.pause();
+    };
+  }, [alertSrc]);
+
+  useEffect(() => {
+    const unlock = () => {
+      const audio = audioAlertRef.current;
+      if (audio) {
+        audio
+          .play()
+          .then(() => {
+            audio.pause();
+            audio.currentTime = 0;
+          })
+          .catch(() => {});
+      }
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (Ctx && !audioCtxRef.current) {
+        try {
+          audioCtxRef.current = new Ctx();
+        } catch {
+          return;
+        }
+      }
+      audioCtxRef.current?.resume().catch(() => {});
+    };
+    window.addEventListener("pointerdown", unlock, { once: true });
+    return () => window.removeEventListener("pointerdown", unlock);
+  }, [alertSrc]);
 
   const finalizeToast = (
     id: string,
@@ -455,10 +556,12 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
   // ===== Derived =====
   const displayRows = useMemo(
     () =>
-      Object.values(stableRef.current)
-        .sort((a, b) => a.firstOrder - b.firstOrder)
-        .map((s) => s.row),
-    [rows, stableVersion]
+      isOld
+        ? rows // BẢNG KÈO CŨ: lấy trực tiếp dữ liệu truyền vào
+        : Object.values(stableRef.current)
+            .sort((a, b) => a.firstOrder - b.firstOrder)
+            .map((s) => s.row),
+    [rows, stableVersion, isOld]
   );
 
   const servers = useMemo(() => {
@@ -513,7 +616,18 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     hideTtlMins, // NEW
   ]);
 
+  // Nhóm & sắp xếp dữ liệu hiển thị
   const grouped = useMemo(() => {
+    if (isOld) {
+      // Bảng kèo cũ: không nhóm theo server, sắp xếp theo thời gian gần nhất (ended_ts/last_update_ts/ts) giảm dần
+      const sortedByRecent = [...filtered].sort((a, b) => {
+        const ta = (a.ended_ts || a.last_update_ts || a.ts || 0) as number;
+        const tb = (b.ended_ts || b.last_update_ts || b.ts || 0) as number;
+        return tb - ta;
+      });
+      return [["__ALL__", sortedByRecent]] as [string, ArbItem[]][];
+    }
+    // Bảng kèo hiện tại: vẫn nhóm theo server như cũ
     const m = new Map<string, ArbItem[]>();
     filtered.forEach((r) => {
       const key = r.server || "UNKNOWN";
@@ -521,7 +635,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
       m.get(key)!.push(r);
     });
     return Array.from(m.entries()).sort(([a], [b]) => a.localeCompare(b));
-  }, [filtered]);
+  }, [filtered, isOld]);
 
   // ===== Handlers =====
   const toggleExpandBroker = (bk: string) => {
@@ -542,19 +656,25 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     const vol = parseFloat(
       (venue === "server" ? volServer[k] : volClient[k]) || "0"
     );
+    const minVol =
+      venue === "server"
+        ? typeof r.min_volume_server === "number"
+          ? r.min_volume_server
+          : 0.01
+        : typeof r.min_volume_client === "number"
+        ? r.min_volume_client
+        : 0.01;
     const broker = venue === "server" ? r.server : r.client;
     const rawSymbol =
       venue === "server" ? r.server_raw || r.symbol : r.client_raw || r.symbol;
-    if (!broker || !rawSymbol || !vol) return;
+    if (!broker || !rawSymbol || !(vol > 0)) return;
+    if (vol < minVol) return;
     sendSignal({
       broker,
       action: "TRADE",
       symbol: rawSymbol,
       side,
       volume: vol,
-      sl_points: 0,
-      tp_points: 0,
-      max_slippage: 30,
       comment: "WebTrade",
     });
   };
@@ -586,8 +706,42 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
     });
   };
 
-  // ===== Effects =====
-  // Maintain stable rows
+  useEffect(() => {
+    const keys = filtered.map(keyOf);
+    setVolServer((v) => {
+      let ch = false;
+      const nv = { ...v };
+      keys.forEach((k) => {
+        if (!(k in nv)) {
+          const row = filtered.find((r) => keyOf(r) === k);
+          const minVol =
+            row && typeof row.min_volume_server === "number"
+              ? String(row.min_volume_server)
+              : "0.01";
+          nv[k] = minVol;
+          ch = true;
+        }
+      });
+      return ch ? nv : v;
+    });
+    setVolClient((v) => {
+      let ch = false;
+      const nv = { ...v };
+      keys.forEach((k) => {
+        if (!(k in nv)) {
+          const row = filtered.find((r) => keyOf(r) === k);
+          const minVol =
+            row && typeof row.min_volume_client === "number"
+              ? String(row.min_volume_client)
+              : "0.01";
+          nv[k] = minVol;
+          ch = true;
+        }
+      });
+      return ch ? nv : v;
+    });
+  }, [filtered]);
+
   useEffect(() => {
     const t = nowSec();
     const currentKeys = new Set<string>();
@@ -667,44 +821,6 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
       setServerFilter("ALL");
     }
   }, [displayRows, serverFilter]);
-
-  // Init volume inputs
-  useEffect(() => {
-    const keys = filtered.map(keyOf);
-    setVolServer((v) => {
-      let ch = false;
-      const nv = { ...v };
-      keys.forEach((k) => {
-        if (!(k in nv)) {
-          nv[k] = "0.01";
-          ch = true;
-        }
-      });
-      return ch ? nv : v;
-    });
-    setVolClient((v) => {
-      let ch = false;
-      const nv = { ...v };
-      keys.forEach((k) => {
-        if (!(k in nv)) {
-          nv[k] = "0.01";
-          ch = true;
-        }
-      });
-      return ch ? nv : v;
-    });
-  }, [filtered]);
-
-  // New row sound (only new table)
-  useEffect(() => {
-    if (isOld) return;
-    const cur = new Set(filtered.map(keyOf));
-    const playNeeded = [...cur].some(
-      (k) => !prevKeysRef.current.has(k) && !isRowMuted(k)
-    );
-    if (playNeeded) playSound();
-    prevKeysRef.current = cur;
-  }, [filtered, isOld, rowMute, quietFrom, quietTo]);
 
   useEffect(() => {
     let timer: any;
@@ -817,48 +933,14 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
 
   // Load audio
   useEffect(() => {
-    const a = new Audio(SOUND_ALERT);
-    a.preload = "auto";
-    a.volume = Math.min(1, Math.max(0, SOUND_VOLUME));
-    audioAlertRef.current = a;
-  }, []);
-
-  // Unlock audio
-  useEffect(() => {
-    const unlock = () => {
-      if (soundUnlockedRef.current) return;
-      try {
-        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new Ctx();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        gain.gain.value = 0.0001;
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        setTimeout(() => {
-          try {
-            osc.stop();
-            ctx.close();
-          } catch {}
-        }, 30);
-      } catch {}
-      soundUnlockedRef.current = true;
-      if (pendingPlayRef.current) {
-        pendingPlayRef.current = false;
-        playSound();
-      }
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
-    };
-    window.addEventListener("pointerdown", unlock, { once: false });
-    window.addEventListener("keydown", unlock, { once: false });
+    const audio = new Audio(alertSrc);
+    audio.preload = "auto";
+    audio.volume = Math.min(1, Math.max(0, SOUND_VOLUME));
+    audioAlertRef.current = audio;
     return () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
+      audio.pause();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [alertSrc]);
 
   // Old age tick
   useEffect(() => {
@@ -1459,6 +1541,8 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
               value={oldMaxAgeSec / 60}
               onChange={(e) => {
                 const mins = Math.max(0, Number(e.target.value) || 0);
+                // Convert phút -> giây tại đây
+                // rồi đổi công thức thành: secs = unit === 'hour' ? hours*3600 : mins*60
                 setOldMaxAgeSec(mins * 60);
               }}
               placeholder="Giữ kèo(min): "
@@ -1468,6 +1552,115 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
         )}
         {!isOld && (
           <>
+            {/* NEW: Global mute theo phút */}
+            <div className="relative">
+              <button
+                ref={gmBtnRef}
+                onClick={() => {
+                  setGmOpen((o) => !o);
+                  setGmBtnRect(
+                    gmBtnRef.current?.getBoundingClientRect() || null
+                  );
+                  // set mặc định khi mở
+                  const remain = isGlobalMuted()
+                    ? Math.ceil((globalMuteUntil! - Date.now()) / 60000)
+                    : 30;
+                  setGmMins(Math.max(1, remain || 30));
+                }}
+                className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 transition-colors ${
+                  isGlobalMuted()
+                    ? "bg-red-600 text-white shadow-sm"
+                    : "bg-neutral-700 hover:bg-neutral-600 text-neutral-200"
+                }`}
+                title="Mute âm thanh kèo mới theo số phút"
+              >
+                <BellOff size={14} />
+                <span>Mute sound</span>
+                {isGlobalMuted() && (
+                  <span className="text-[9px] font-semibold bg-white/20 px-1 rounded">
+                    ON
+                  </span>
+                )}
+              </button>
+              {gmOpen &&
+                createPortal(
+                  <div
+                    className="fixed z-[500] w-64 p-3 rounded-md border border-neutral-600 bg-neutral-900 shadow-xl"
+                    style={{
+                      top: gmBtnRect?.bottom ?? 0,
+                      left: gmBtnRect?.left ?? 0,
+                    }}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-neutral-200">
+                        Mute theo phút
+                      </span>
+                      <button
+                        onClick={() => setGmOpen(false)}
+                        className="px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600 text-[10px]"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <input
+                        type="number"
+                        min={1}
+                        value={gmMins}
+                        onChange={(e) =>
+                          setGmMins(Math.max(1, Number(e.target.value) || 30))
+                        }
+                        className="w-24 bg-neutral-800/80 border border-neutral-600 rounded px-2 py-1 text-[11px] text-center"
+                        placeholder="Phút"
+                        title="Số phút mute (>=1)"
+                      />
+                      <button
+                        onClick={() => {
+                          setGlobalMuteUntil(Date.now() + gmMins * 60000);
+                          setGmOpen(false);
+                        }}
+                        className="px-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-[11px] text-white"
+                      >
+                        Áp dụng
+                      </button>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => {
+                          setGlobalMuteUntil(null);
+                          setGmOpen(false);
+                        }}
+                        className="flex-1 px-2 py-1 rounded bg-green-600/70 hover:bg-green-500 text-[11px] text-white"
+                      >
+                        Bật lại
+                      </button>
+                      <button
+                        onClick={() => {
+                          // Mute nhanh với 15 phút nếu chưa nhập
+                          const mins = gmMins || 30;
+                          setGlobalMuteUntil(Date.now() + mins * 60000);
+                          setGmOpen(false);
+                        }}
+                        className="flex-1 px-2 py-1 rounded bg-red-600/70 hover:bg-red-500 text-[11px] text-white"
+                      >
+                        Mute
+                      </button>
+                    </div>
+                    <p className="mt-2 text-[10px] text-neutral-400 leading-snug">
+                      Đang {isGlobalMuted() ? "mute" : "không mute"}.
+                      {isGlobalMuted() && globalMuteUntil
+                        ? ` Còn ~${Math.max(
+                            0,
+                            Math.ceil((globalMuteUntil - Date.now()) / 60000)
+                          )} phút.`
+                        : ""}
+                    </p>
+                  </div>,
+                  document.body
+                )}
+            </div>
+
+            {/* Đổi tên “Mute” cũ -> Lịch im lặng */}
             <div className="relative">
               <button
                 ref={quietBtnRef}
@@ -1485,7 +1678,7 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                 title="Thiết lập khoảng giờ im lặng âm thanh"
               >
                 <Calendar size={14} />
-                <span>Mute</span>
+                <span>Lịch im lặng</span>
                 {isWithinQuiet() && (
                   <span className="text-[9px] font-semibold bg-white/20 px-1 rounded">
                     ON
@@ -1588,22 +1781,26 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
               <th className="text-left">Client</th>
               <th className="text-center">Client / One-Click</th>
               <th className="text-left">Symbol</th>
+              {isOld && <th className="text-center">Thời gian</th>}
               <th className="text-right">Độ lệch</th>
               <th className="text-center">Gap Pts</th>
-              {!isOld && <th className="text-center">Mark</th>}
+              {!isOld && <th className="text-center">No alert</th>}
               <th className="text-left">Server</th>
               <th className="text-center">Server / One-Click</th>
-              <th className="text-center">Action</th> {/* NEW */}
+              <th className="text-center">Action</th>
+              <th className="text-center">Có kèo</th>
             </tr>
           </thead>
           <tbody>
             {grouped.map(([, list]) => {
-              const sorted = [...list].sort(
-                (a, b) =>
-                  (a.symbol || "").localeCompare(b.symbol || "") ||
-                  (a.client || "").localeCompare(b.client || "")
-              );
-              return sorted.map((r) => {
+              const rowsToRender = isOld
+                ? list
+                : [...list].sort(
+                    (a, b) =>
+                      (a.symbol || "").localeCompare(b.symbol || "") ||
+                      (a.client || "").localeCompare(b.client || "")
+                  );
+              return rowsToRender.map((r) => {
                 const k = keyOf(r);
                 const bidServer = r.bid_server,
                   askServer = r.ask_server;
@@ -1622,6 +1819,13 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                   : t2
                   ? "SELL"
                   : null;
+                const localTimeDisplay =
+                  r.local_time ||
+                  (r.ended_ts && fmtYmdHms(new Date(r.ended_ts * 1000))) ||
+                  (r.last_update_ts &&
+                    fmtYmdHms(new Date(r.last_update_ts * 1000))) ||
+                  (r.ts && fmtYmdHms(new Date(r.ts * 1000))) ||
+                  "-";
                 const fsBidServer = formatMini(bidServer, {
                   symbol: r.symbol,
                   category: r.category,
@@ -1670,6 +1874,12 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                       <div className="flex flex-col items-center gap-2">
                         <input
                           type="number"
+                          step="0.01"
+                          min={Number(
+                            typeof r.min_volume_client === "number"
+                              ? r.min_volume_client
+                              : 0.01
+                          )}
                           className="w-20 bg-neutral-900 border border-neutral-600 rounded px-1 py-1 text-[11px] font-medium text-center mb-1"
                           value={volClient[k] || ""}
                           onChange={(e) =>
@@ -1759,6 +1969,11 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                           );
                         })()}
                     </td>
+                    {isOld && (
+                      <td className="px-3 py-1 text-center font-mono">
+                        {localTimeDisplay}
+                      </td>
+                    )}
                     <td className="px-3 py-1 text-right font-mono">
                       {diff != null ? diff.toFixed(2) : "-"}
                     </td>
@@ -1868,6 +2083,12 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                       <div className="flex flex-col items-center gap-2">
                         <input
                           type="number"
+                          step="0.01"
+                          min={Number(
+                            typeof r.min_volume_server === "number"
+                              ? r.min_volume_server
+                              : 0.01
+                          )}
                           className="w-20 bg-neutral-900 border border-neutral-600 rounded px-1 py-1 text-[11px] font-medium text-center mb-1"
                           value={volServer[k] || ""}
                           onChange={(e) =>
@@ -1950,6 +2171,83 @@ export default function FullTriggerTable({ rows, disableSound, isOld }: Props) {
                         </button>
                       )}
                     </td>
+                    <td className="px-3 py-1 text-center">
+                      {/* Nút đẩy lên sheet KÊO PYTHON */}
+                      <button
+                        onClick={async () => {
+                          const toastId = `PUSH_${r.server || ""}_${
+                            r.client || ""
+                          }_${r.symbol || ""}_${Date.now()}`;
+                          try {
+                            upsertToast(
+                              setToasts,
+                              toastId,
+                              "pending",
+                              "Đang đẩy data..."
+                            );
+                            const cfg = await getSheetsConfig();
+                            const owner = cfg?.owner_name || "";
+                            const now = new Date();
+                            const timeClick = fmtYmdHms(now);
+
+                            // thời điểm xuất hiện arbitrage (ưu tiên ended_ts -> last_update_ts -> ts)
+                            const base =
+                              (r.ended_ts as any) ||
+                              (r.last_update_ts as any) ||
+                              (r.ts as any) ||
+                              Math.floor(Date.now() / 1000);
+                            const appear = fmtYmdHms(
+                              new Date(Number(base) * 1000)
+                            );
+
+                            const diffAbs = r.trigger1
+                              ? r.diff1_points_abs
+                              : r.trigger2
+                              ? r.diff2_points_abs
+                              : r.diff1_points_abs ??
+                                r.diff2_points_abs ??
+                                r.gap_pts;
+
+                            const res = await pushKeoRow({
+                              owner_name: owner,
+                              local_time: timeClick,
+                              appear_time: appear,
+                              client_name: r.client || "",
+                              symbol: r.symbol || "",
+                              do_lech:
+                                diffAbs == null
+                                  ? ""
+                                  : typeof diffAbs === "number"
+                                  ? diffAbs
+                                  : String(diffAbs),
+                              server_name: r.server || "",
+                            });
+                            if (!res.ok)
+                              throw new Error(
+                                res.error || res.detail || "Push fail"
+                              );
+                            upsertToast(
+                              setToasts,
+                              toastId,
+                              "success",
+                              "Đẩy data thành công"
+                            );
+                          } catch (e: any) {
+                            upsertToast(
+                              setToasts,
+                              toastId,
+                              "fail",
+                              e?.message || "Push thất bại"
+                            );
+                          }
+                        }}
+                        className="inline-flex items-center justify-center w-7 h-7 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white"
+                        title="Gửi dòng này lên Google Sheet (KÊO PYTHON)"
+                        aria-label="Push lên Sheet"
+                      >
+                        <ArrowUp size={14} />
+                      </button>
+                    </td>
                   </tr>
                 );
               });
@@ -2017,7 +2315,7 @@ function RowMuteEditor({
   onUnmute: () => void;
 }) {
   const [mins, setMins] = useState(
-    value?.until ? Math.ceil((value.until - Date.now()) / 60000) : 0
+    value?.until ? Math.ceil((value.until - Date.now()) / 60000) : 30
   );
   return (
     <div className="space-y-2">
