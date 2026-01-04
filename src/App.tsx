@@ -243,7 +243,7 @@ export default function App() {
                 value={tempOwner}
                 onChange={(e) => setTempOwner(e.target.value)}
               >
-                {["Lâm", "Khang", "Phát", "Phi", "Tâm", "Tuấn"].map((n) => (
+                {["Lâm", "Khang", "Phát", "Phi", "Tâm", "Tuấn","Dinh","Kiệt","Việt"].map((n) => (
                   <option key={n} value={n}>
                     {n}
                   </option>
